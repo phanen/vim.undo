@@ -25,7 +25,7 @@ pub const Hunk = struct {
     lines: []Line,
 };
 
-pub const Error = std.mem.Allocator.Error || std.fs.File.WriteError;
+pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error;
 
 pub fn diff(
     alloc: std.mem.Allocator,
@@ -37,16 +37,20 @@ pub fn diff(
     defer script.deinit(alloc);
 
     const hunks = try buildHunks(alloc, script.items, a.len, b.len, context);
-    defer alloc.free(hunks);
+    defer {
+        for (hunks) |h| alloc.free(h.lines);
+        alloc.free(hunks);
+    }
 
     var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
+    errdefer out.deinit();
 
     try out.writer.print("--- a\n+++ b\n", .{});
     for (hunks) |h| {
         try formatHunk(&out.writer, h);
     }
-    return out.written();
+    const result = try out.toOwnedSlice();
+    return result;
 }
 
 const ScriptOp = struct {
@@ -146,10 +150,8 @@ fn buildHunks(
         var a_count: usize = 0;
         var b_count: usize = 0;
         var lines: std.ArrayList(Line) = .empty;
-        errdefer {
-            lines.deinit(alloc);
-            alloc.free(lines.items);
-        }
+        var owned_lines: ?[]Line = null;
+        errdefer if (owned_lines) |s| alloc.free(s);
 
         var k: usize = 0;
         while (k < pre) : (k += 1) {
@@ -174,8 +176,7 @@ fn buildHunks(
             b_count += 1;
         }
 
-        try lines.ensureTotalCapacity(alloc, lines.items.len);
-        const lines_slice = try lines.toOwnedSlice(alloc);
+        owned_lines = try lines.toOwnedSlice(alloc);
 
         const a_start = a_idx - pre;
         const b_start = b_idx - pre;
@@ -185,8 +186,9 @@ fn buildHunks(
             .a_count = a_count,
             .b_start = b_start,
             .b_count = b_count,
-            .lines = lines_slice,
+            .lines = owned_lines.?,
         });
+        owned_lines = null;
 
         var j: usize = 0;
         while (j < pre + (end - start) + post) : (j += 1) {
