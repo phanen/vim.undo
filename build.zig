@@ -36,4 +36,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    const fixture_step = b.step("fixture", "Regenerate tests/fixtures/sample.un~ via nvim");
+    const fixture_cmd = b.addSystemCommand(&.{
+        "nvim", "--clean", "-u", "tests/fixtures/generate.lua",
+    });
+    fixture_step.dependOn(&fixture_cmd.step);
 }
