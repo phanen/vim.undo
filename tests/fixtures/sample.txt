@@ -1,0 +1,3 @@
+foo bar baz
+inserted at line 2
+ops
