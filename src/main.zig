@@ -1,25 +1,141 @@
 const std = @import("std");
 const vu = @import("vim_undo");
 
+const SubCmd = enum { list, snap, diff };
+
+const Options = struct {
+    undofile: []const u8,
+    textfile: ?[]const u8 = null,
+    seq: ?u32 = null,
+    b_seq: ?u32 = null,
+};
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    var args = init.minimal.args.iterate();
-    _ = args.next() orelse {
+    var args_iter = init.minimal.args.iterate();
+    _ = args_iter.next() orelse {
         try usage(io);
         return;
     };
-    const path = args.next() orelse {
+    while (args_iter.next()) |a| {
+        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
+            try usage(io);
+            return;
+        }
+    }
+    args_iter = init.minimal.args.iterate();
+    _ = args_iter.next() orelse {
+        try usage(io);
+        return;
+    };
+    const sub_str = args_iter.next() orelse {
         try usage(io);
         std.process.exit(2);
     };
-    const sub = args.next() orelse {
+    const sub: SubCmd = std.meta.stringToEnum(SubCmd, sub_str) orelse {
+        try stderrPrint(io, "unknown subcommand: {s}\n", .{sub_str});
         try usage(io);
         std.process.exit(2);
     };
 
-    const input = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+    var opts: Options = .{ .undofile = undefined };
+    var saw_textfile = false;
+    var positional: [4][]const u8 = undefined;
+    var positional_n: usize = 0;
+
+    while (args_iter.next()) |a| {
+        if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--file")) {
+            const p = args_iter.next() orelse {
+                try stderrPrint(io, "{s}: -f requires a path argument\n", .{sub_str});
+                std.process.exit(2);
+            };
+            if (saw_textfile) {
+                try stderrPrint(io, "{s}: -f given twice\n", .{sub_str});
+                std.process.exit(2);
+            }
+            opts.textfile = p;
+            saw_textfile = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
+            try usage(io);
+            return;
+        }
+        if (positional_n >= positional.len) {
+            try stderrPrint(io, "{s}: too many positional arguments\n", .{sub_str});
+            std.process.exit(2);
+        }
+        positional[positional_n] = a;
+        positional_n += 1;
+    }
+
+    switch (sub) {
+        .list => {
+            if (positional_n < 1) {
+                try stderrPrint(io, "list: missing <undofile>\n", .{});
+                std.process.exit(2);
+            }
+            if (positional_n > 1) {
+                try stderrPrint(io, "list: takes no arguments after <undofile>\n", .{});
+                std.process.exit(2);
+            }
+            opts.undofile = positional[0];
+        },
+        .snap => {
+            if (positional_n < 2) {
+                try stderrPrint(io, "snap: missing <undofile> <seq>\n", .{});
+                std.process.exit(2);
+            }
+            opts.undofile = positional[0];
+            opts.seq = std.fmt.parseInt(u32, positional[1], 10) catch {
+                try stderrPrint(io, "snap: <seq> must be an integer, got: {s}\n", .{positional[1]});
+                std.process.exit(2);
+            };
+            if (positional_n >= 3) {
+                if (saw_textfile) {
+                    try stderrPrint(io, "snap: textfile given twice\n", .{});
+                    std.process.exit(2);
+                }
+                opts.textfile = positional[2];
+                saw_textfile = true;
+            }
+            if (!saw_textfile) {
+                try stderrPrint(io, "snap: missing <textfile> (or -f <textfile>)\n", .{});
+                std.process.exit(2);
+            }
+        },
+        .diff => {
+            if (positional_n < 3) {
+                try stderrPrint(io, "diff: missing <undofile> <seqA> <seqB>\n", .{});
+                std.process.exit(2);
+            }
+            opts.undofile = positional[0];
+            opts.seq = std.fmt.parseInt(u32, positional[1], 10) catch {
+                try stderrPrint(io, "diff: <seqA> must be an integer, got: {s}\n", .{positional[1]});
+                std.process.exit(2);
+            };
+            opts.b_seq = std.fmt.parseInt(u32, positional[2], 10) catch {
+                try stderrPrint(io, "diff: <seqB> must be an integer, got: {s}\n", .{positional[2]});
+                std.process.exit(2);
+            };
+            if (positional_n >= 4) {
+                if (saw_textfile) {
+                    try stderrPrint(io, "diff: textfile given twice\n", .{});
+                    std.process.exit(2);
+                }
+                opts.textfile = positional[3];
+                saw_textfile = true;
+            }
+            if (!saw_textfile) {
+                try stderrPrint(io, "diff: missing <textfile> (or -f <textfile>)\n", .{});
+                std.process.exit(2);
+            }
+        },
+    }
+
+    const input = try std.Io.Dir.cwd().readFileAlloc(io, opts.undofile, gpa, .unlimited);
     defer gpa.free(input);
     const fh = try vu.undofile.Parser.parse(gpa, input);
     defer vu.undofile.Parser.deinit(fh, gpa);
@@ -27,38 +143,10 @@ pub fn main(init: std.process.Init) !void {
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
 
-    if (std.mem.eql(u8, sub, "list")) {
-        try cmdList(&w, fh);
-    } else if (std.mem.eql(u8, sub, "snap")) {
-        const seq_str = args.next() orelse {
-            try stderrPrint(io, "snap: missing <seq> <textfile>\n", .{});
-            std.process.exit(2);
-        };
-        const seq = try std.fmt.parseInt(u32, seq_str, 10);
-        const text_path = args.next() orelse {
-            try stderrPrint(io, "snap: missing <textfile> (the buffer the undofile was written for)\n", .{});
-            std.process.exit(2);
-        };
-        try cmdSnap(gpa, io, &w, fh, seq, text_path);
-    } else if (std.mem.eql(u8, sub, "diff")) {
-        const a_str = args.next() orelse {
-            try stderrPrint(io, "diff: missing <seqA> <seqB> <textfile>\n", .{});
-            std.process.exit(2);
-        };
-        const b_str = args.next() orelse {
-            try stderrPrint(io, "diff: missing <seqB> <textfile>\n", .{});
-            std.process.exit(2);
-        };
-        const a = try std.fmt.parseInt(u32, a_str, 10);
-        const b = try std.fmt.parseInt(u32, b_str, 10);
-        const text_path = args.next() orelse {
-            try stderrPrint(io, "diff: missing <textfile>\n", .{});
-            std.process.exit(2);
-        };
-        try cmdDiff(gpa, io, &w, fh, a, b, text_path);
-    } else {
-        try stderrPrint(io, "unknown subcommand: {s}\n", .{sub});
-        std.process.exit(2);
+    switch (sub) {
+        .list => try cmdList(&w, fh),
+        .snap => try cmdSnap(gpa, io, &w, fh, opts.seq.?, opts.textfile.?),
+        .diff => try cmdDiff(gpa, io, &w, fh, opts.seq.?, opts.b_seq.?, opts.textfile.?),
     }
 
     try std.Io.File.stdout().writeStreamingAll(io, w.buffered());
@@ -156,7 +244,7 @@ fn cmdDiff(
     };
     defer vu.replay.deinit(a, alloc);
     const b = vu.replay.snapshotAt(alloc, initial, &fh, b_seq) catch |e| {
-        try w.print("error snapshotAt({d}): {s}\n", .{ b_seq, @errorName(e) });
+        try w.print("error snapshotAt({d}): {s}\n", .{ b_seq, @errorName(e)});
         return;
     };
     defer vu.replay.deinit(b, alloc);
@@ -168,15 +256,19 @@ fn cmdDiff(
 
 fn usage(io: std.Io) !void {
     try stderrPrint(io,
-        \\usage: vim-undo <undofile> <subcommand> [args]
+        \\usage: vim-undo <subcommand> <undofile> [args] [-f <textfile>]
         \\
         \\subcommands:
-        \\  list                       list all undo headers
-        \\  snap <seq> <textfile>      print buffer state at <seq>
-        \\  diff <a> <b> <textfile>    unified diff from <a> to <b>
+        \\  list <undofile>
+        \\  snap <undofile> <seq> [-f <textfile>]
+        \\  diff <undofile> <seqA> <seqB> [-f <textfile>]
         \\
         \\<textfile> is the buffer content the .un~ was written for; it is
         \\needed to reconstruct leaves reachable from the redo chain.
+        \\
+        \\flags:
+        \\  -f, --file <path>   textfile (alternatively the last positional arg)
+        \\  -h, --help          show this help
         \\
     , .{});
 }
