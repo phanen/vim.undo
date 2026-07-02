@@ -164,7 +164,10 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
-    try std.Io.File.stdout().writeStreamingAll(io, w.buffered());
+    std.Io.File.stdout().writeStreamingAll(io, w.buffered()) catch |e| switch (e) {
+        error.BrokenPipe => std.process.exit(0),
+        else => return e,
+    };
 }
 
 fn stderrPrint(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
