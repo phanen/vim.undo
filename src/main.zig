@@ -94,7 +94,15 @@ pub fn main(init: std.process.Init) !void {
                 textfile = positional[2];
             }
             if (textfile == null) {
-                try stderrPrint(io, "snap: missing <textfile> (use -f <textfile> or pass as last positional)\n", .{});
+                const auto = autoDetectTextfile(io, positional[0]) catch null;
+                if (auto) |p| textfile = p;
+            }
+            if (textfile == null) {
+                try stderrPrint(io,
+                    \\snap: missing <textfile>
+                    \\(use -f <textfile>, or pass as last positional; auto-detect failed)
+                    \\
+                , .{});
                 std.process.exit(2);
             }
         },
@@ -122,7 +130,15 @@ pub fn main(init: std.process.Init) !void {
                 textfile = positional[3];
             }
             if (textfile == null) {
-                try stderrPrint(io, "diff: missing <textfile> (use -f <textfile> or pass as last positional)\n", .{});
+                const auto = autoDetectTextfile(io, positional[0]) catch null;
+                if (auto) |p| textfile = p;
+            }
+            if (textfile == null) {
+                try stderrPrint(io,
+                    \\diff: missing <textfile>
+                    \\(use -f <textfile>, or pass as last positional; auto-detect failed)
+                    \\
+                , .{});
                 std.process.exit(2);
             }
         },
@@ -156,6 +172,56 @@ fn stderrPrint(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var w: std.Io.Writer = .fixed(&buf);
     try w.print(fmt, args);
     try std.Io.File.stderr().writeStreamingAll(io, w.buffered());
+}
+
+fn autoDetectTextfile(io: std.Io, undofile: []const u8) ![]const u8 {
+    const alloc = std.heap.page_allocator;
+
+    if (std.mem.endsWith(u8, undofile, ".un~")) {
+        const without = undofile[0 .. undofile.len - ".un~".len];
+        const last_sep = std.mem.lastIndexOfScalar(u8, without, '/') orelse 0;
+        const dir = without[0..last_sep];
+        const base = without[last_sep..];
+        if (base.len > 0 and base[0] == '.') {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const candidate_len = dir.len + 1 + (base.len - 1);
+            if (candidate_len <= buf.len) {
+                @memcpy(buf[0..dir.len], dir);
+                buf[dir.len] = '/';
+                @memcpy(buf[dir.len + 1 ..][0 .. base.len - 1], base[1..]);
+                const candidate = buf[0..candidate_len];
+                if (std.Io.Dir.cwd().statFile(io, candidate, .{})) |_| {
+                    return try alloc.dupe(u8, candidate);
+                } else |_| {}
+            }
+        }
+    }
+
+    if (std.mem.lastIndexOfScalar(u8, undofile, '/')) |last_sep| {
+        const tail = undofile[last_sep + 1 ..];
+        const has_percent = std.mem.indexOfScalar(u8, tail, '%') != null;
+        if (has_percent and !std.mem.endsWith(u8, undofile, ".un~")) {
+            const encoded = undofile[last_sep + 1 ..];
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            var n: usize = 0;
+            for (encoded) |c| {
+                if (c == '%') {
+                    buf[n] = '/';
+                } else {
+                    buf[n] = c;
+                }
+                n += 1;
+            }
+            if (n <= buf.len) {
+                const candidate = buf[0..n];
+                if (std.Io.Dir.cwd().statFile(io, candidate, .{})) |_| {
+                    return try alloc.dupe(u8, candidate);
+                } else |_| {}
+            }
+        }
+    }
+
+    return error.NotFound;
 }
 
 fn readLines(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]const []const u8 {
@@ -264,13 +330,24 @@ fn usage(io: std.Io) !void {
         \\  diff <undofile> <a> <b> [-f <textfile>]
         \\
         \\<textfile> is the buffer content the .un~ was written for.
-        \\It is REQUIRED for snap and diff, because the newhead's state
-        \\(the saved file at write time) is not stored in the .un~.
-        \\Pass it via -f or as the last positional argument.
+        \\If -f is omitted, vim-undo tries to recover the path from the
+        \\undofile name itself: 'undodir == "."' produces ".foo.un~"
+        \\next to the file; otherwise Neovim percent-encodes path
+        \\separators (see src/nvim/undo.c:u_get_undo_file_name) and we
+        \\decode them. Auto-detect only works if the original file
+        \\still exists at the decoded path. Use -f when it has been
+        \\moved or renamed.
         \\
         \\flags:
         \\  -f, --file <path>   textfile (or pass as last positional)
         \\  -h, --help          show this help
         \\
     , .{});
+}
+
+test "autoDetectTextfile: rejects bogus percent-encoded path" {
+    const alloc = std.testing.allocator;
+    defer _ = alloc;
+    const result = autoDetectTextfile(std.testing.io, "/nonexistent/%foo%bar");
+    try std.testing.expect(result == error.NotFound);
 }
