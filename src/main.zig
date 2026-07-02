@@ -35,6 +35,7 @@ pub fn main(init: std.process.Init) !void {
 
     var undofile: ?[]const u8 = null;
     var textfile: ?[]const u8 = null;
+    var label_root: ?[]const u8 = null;
     var seq: ?u32 = null;
     var a_seq: ?u32 = null;
     var b_seq: ?u32 = null;
@@ -52,6 +53,18 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(2);
             }
             textfile = p;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "-L") or std.mem.eql(u8, a, "--label-root")) {
+            const p = args_iter.next() orelse {
+                try stderrPrint(io, "{s}: -L requires a path argument\n", .{sub_str});
+                std.process.exit(2);
+            };
+            if (label_root != null) {
+                try stderrPrint(io, "{s}: -L given twice\n", .{sub_str});
+                std.process.exit(2);
+            }
+            label_root = p;
             continue;
         }
         if (positional_n >= positional.len) {
@@ -117,17 +130,25 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(2);
             };
             if (positional_n >= 3) {
-                a_seq = std.fmt.parseInt(u32, positional[2], 10) catch {
-                    try stderrPrint(io, "diff: <a> must be an integer, got: {s}\n", .{positional[2]});
-                    std.process.exit(2);
-                };
-            }
-            if (positional_n >= 4) {
                 if (textfile != null) {
-                    try stderrPrint(io, "diff: textfile given twice\n", .{});
-                    std.process.exit(2);
+                    a_seq = std.fmt.parseInt(u32, positional[2], 10) catch {
+                        try stderrPrint(io, "diff: <a> must be an integer, got: {s}\n", .{positional[2]});
+                        std.process.exit(2);
+                    };
+                    if (positional_n >= 4) {
+                        try stderrPrint(io, "diff: textfile already set via -f; cannot also pass positional textfile\n", .{});
+                        std.process.exit(2);
+                    }
+                } else {
+                    if (std.fmt.parseInt(u32, positional[2], 10)) |v| {
+                        a_seq = v;
+                        if (positional_n >= 4) {
+                            textfile = positional[3];
+                        }
+                    } else |_| {
+                        textfile = positional[2];
+                    }
                 }
-                textfile = positional[3];
             }
             if (textfile == null) {
                 const auto = autoDetectTextfile(io, positional[0]) catch null;
@@ -149,7 +170,7 @@ pub fn main(init: std.process.Init) !void {
     const fh = try vu.undofile.Parser.parse(gpa, input);
     defer vu.undofile.Parser.deinit(fh, gpa);
 
-    var buf: [4096]u8 = undefined;
+    var buf: [1 * 1024 * 1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
 
     switch (sub) {
@@ -160,7 +181,16 @@ pub fn main(init: std.process.Init) !void {
         },
         .diff => {
             const a = a_seq orelse fh.seq_last;
-            try cmdDiff(gpa, io, &w, fh, a, b_seq.?, textfile.?);
+            try cmdDiff(
+                gpa,
+                io,
+                &w,
+                fh,
+                textfile.?,
+                label_root,
+                a,
+                b_seq.?,
+            );
         },
     }
 
@@ -293,9 +323,10 @@ fn cmdDiff(
     io: std.Io,
     w: *std.Io.Writer,
     fh: vu.undofile.FileHeader,
+    text_path: []const u8,
+    label_root: ?[]const u8,
     a_seq: u32,
     b_seq: u32,
-    text_path: []const u8,
 ) !void {
     const initial = readLines(alloc, io, text_path) catch |e| {
         try w.print("error reading {s}: {s}\n", .{ text_path, @errorName(e) });
@@ -317,7 +348,27 @@ fn cmdDiff(
     };
     defer vu.replay.deinit(b, alloc);
 
-    const out = try vu.diff.diff(alloc, a.lines, b.lines, 3);
+    const rel = blk: {
+        const root = label_root orelse break :blk text_path;
+        if (!std.mem.startsWith(u8, text_path, root)) {
+            try w.print("error: --label-root={s} is not a prefix of textfile path {s}\n", .{ root, text_path });
+            return;
+        }
+        const after = text_path[root.len..];
+        const suffix = if (std.mem.startsWith(u8, after, "/")) after[1..] else after;
+        const root_basename = std.fs.path.basename(root);
+        const prefixed = try alloc.alloc(u8, root_basename.len + 1 + suffix.len);
+        @memcpy(prefixed[0..root_basename.len], root_basename);
+        prefixed[root_basename.len] = '/';
+        @memcpy(prefixed[root_basename.len + 1 ..][0..suffix.len], suffix);
+        break :blk prefixed;
+    };
+    defer if (label_root != null) alloc.free(rel);
+
+    const a_label: []const u8 = rel;
+    const b_label: []const u8 = rel;
+
+    const out = try vu.diff.diff(alloc, a.lines, b.lines, a_label, b_label, 3);
     defer alloc.free(out);
     try w.writeAll(out);
 }
@@ -341,8 +392,17 @@ fn usage(io: std.Io) !void {
         \\still exists at the decoded path. Use -f when it has been
         \\moved or renamed.
         \\
+        \\Diff labels are the absolute path of <textfile> by default, so diff
+        \\viewers like delta show the full path. To make the diff apply
+        \\with 'patch -Np1 -i -', pass -L <dir> where <dir> is the
+        \\directory the user will 'cd' into before applying: vim-undo
+        \\emits '<dir basename>/<textfile relative to <dir>>' and patch
+        \\-p1 strips the synthetic prefix. GNU patch refuses absolute
+        \\paths as 'dangerous', so absolute labels are display-only.
+        \\
         \\flags:
         \\  -f, --file <path>   textfile (or pass as last positional)
+        \\  -L, --label-root <dir>  emit '<dir basename>/<rel>' for patch -p1
         \\  -h, --help          show this help
         \\
     , .{});

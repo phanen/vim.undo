@@ -1,8 +1,4 @@
 //! Line-level unified diff between two BufferState snapshots.
-//!
-//! Uses an O(N*M) LCS dynamic-programming table — the undo tree's
-//! snapshot sizes are tiny (<1k lines), so the constant factor matters
-//! more than asymptotic complexity.
 
 const std = @import("std");
 
@@ -31,6 +27,8 @@ pub fn diff(
     alloc: std.mem.Allocator,
     a: []const []const u8,
     b: []const []const u8,
+    a_label: []const u8,
+    b_label: []const u8,
     context: usize,
 ) Error![]u8 {
     var script = try buildEditScript(alloc, a, b);
@@ -45,7 +43,7 @@ pub fn diff(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
-    try out.writer.print("--- a\n+++ b\n", .{});
+    try out.writer.print("--- {s}\n+++ {s}\n", .{ a_label, b_label });
     for (hunks) |h| {
         try formatHunk(&out.writer, h);
     }
@@ -212,7 +210,7 @@ fn buildHunks(
 }
 
 fn formatHunk(w: *std.Io.Writer, h: Hunk) Error!void {
-    try w.print("@@ -{} +{} @@\n", .{ h.a_start, h.b_start });
+    try w.print("@@ -{},{} +{},{} @@\n", .{ h.a_start, h.a_count, h.b_start, h.b_count });
     for (h.lines) |line| {
         const prefix: u8 = switch (line.op) {
             .context => ' ',
@@ -231,15 +229,15 @@ const allocator = testing.allocator;
 
 test "diff identical inputs emits no hunks" {
     const lines: []const []const u8 = &.{ "a", "b", "c" };
-    const out = try diff(allocator, lines, lines, 3);
+    const out = try diff(allocator, lines, lines, "left.txt", "right.txt", 3);
     defer allocator.free(out);
-    try testing.expectEqualStrings("--- a\n+++ b\n", out);
+    try testing.expectEqualStrings("--- left.txt\n+++ right.txt\n", out);
 }
 
 test "diff single insertion" {
     const a: []const []const u8 = &.{ "a", "c" };
     const b: []const []const u8 = &.{ "a", "b", "c" };
-    const out = try diff(allocator, a, b, 3);
+    const out = try diff(allocator, a, b, "left.txt", "right.txt", 3);
     defer allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "+b") != null);
 }
@@ -247,7 +245,7 @@ test "diff single insertion" {
 test "diff single deletion" {
     const a: []const []const u8 = &.{ "a", "b", "c" };
     const b: []const []const u8 = &.{ "a", "c" };
-    const out = try diff(allocator, a, b, 3);
+    const out = try diff(allocator, a, b, "left.txt", "right.txt", 3);
     defer allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "-b") != null);
 }
@@ -255,7 +253,7 @@ test "diff single deletion" {
 test "diff replaces one line" {
     const a: []const []const u8 = &.{ "x", "y", "z" };
     const b: []const []const u8 = &.{ "x", "Y", "z" };
-    const out = try diff(allocator, a, b, 3);
+    const out = try diff(allocator, a, b, "left.txt", "right.txt", 3);
     defer allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "-y") != null);
     try testing.expect(std.mem.indexOf(u8, out, "+Y") != null);
