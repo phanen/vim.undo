@@ -5,13 +5,6 @@
 //! newhead edit) and applying `u_undoredo` walks for every header between
 //! the newhead and the target along the linear `uh_next` chain (which
 //! points toward older states).
-//!
-//! Each `u_entry` records (top, bot, size, lines) where `lines` is the
-//! PRE-change content of the affected region; `u_undoredo` always
-//! applies entries as undo (POST -> PRE), so replaying back from the
-//! saved file gives the buffer just after each intermediate header's
-//! edit. Lines borrow from the original .un~ input - only the array
-//! of pointer slots is allocated.
 
 const std = @import("std");
 const undofile = @import("undofile.zig");
@@ -26,15 +19,8 @@ pub const ReplayError = error{
 } || std.mem.Allocator.Error;
 
 /// Walk the undo tree from newhead down to `target_seq` (exclusive),
-/// applying each visited header's entries as `u_undoredo` would (delete
-/// `oldsize` rows starting at `top`, insert `lines`). Returns the buffer
-/// state immediately after `target_seq`'s edit, i.e. the buffer as the
-/// user would have seen with `curhead == target_seq`.
-///
-/// `initial` must be the buffer at newhead's time - typically the file
-/// content of the buffer that the .un~ was written for. For
-/// `target_seq == fh.seq_last` no walk is performed and `initial` is
-/// returned.
+/// applying each visited header's entries as `u_undoredo` would. Returns
+/// the buffer state immediately after `target_seq`'s edit.
 pub fn snapshotAt(
     alloc: std.mem.Allocator,
     initial: []const []const u8,
@@ -49,21 +35,22 @@ pub fn snapshotAt(
         return .{ .lines = try lines.toOwnedSlice(alloc) };
     }
 
-    const start = findHeader(fh.headers, fh.seq_last)
-        orelse return error.SeqNotFound;
+    const start = findHeader(fh.headers, fh.seq_last) orelse return error.SeqNotFound;
+    var current: *const undofile.Header = start;
+    // One full chain pass covers every header at most once; any further
+    // step must revisit a previous node, which is a malformed chain.
+    const max_walk_steps = fh.headers.len;
+    var walk_steps_taken: usize = 0;
+    while (current.seq != target_seq) {
+        if (walk_steps_taken >= max_walk_steps) return error.SeqNotFound;
+        if (current.next_seq == 0) return error.SeqNotFound;
 
-    var cur: *const undofile.Header = start;
-    var depth: usize = 0;
-    while (cur.seq != target_seq) : (depth += 1) {
-        if (depth > fh.headers.len * 4) return error.SeqNotFound;
-        if (cur.next_seq == 0) return error.SeqNotFound;
-
-        for (cur.entries) |e| {
+        for (current.entries) |e| {
             try applyEntry(alloc, &lines, e);
         }
 
-        cur = findHeader(fh.headers, cur.next_seq)
-            orelse return error.SeqNotFound;
+        current = findHeader(fh.headers, current.next_seq) orelse return error.SeqNotFound;
+        walk_steps_taken += 1;
     }
 
     return .{ .lines = try lines.toOwnedSlice(alloc) };
@@ -85,20 +72,24 @@ fn applyEntry(
     lines: *std.ArrayList([]const u8),
     e: undofile.Entry,
 ) ReplayError!void {
-    const top: usize = @intCast(e.top);
-    if (top > lines.items.len) return error.RangeOutOfBounds;
+    const top_line_index: usize = @intCast(e.top_line);
+    if (top_line_index > lines.items.len) return error.RangeOutOfBounds;
 
-    const oldsize: usize = if (e.bot == 0)
-        lines.items.len - top
-    else
-        e.bot - top - 1;
-    if (top + oldsize > lines.items.len) return error.RangeOutOfBounds;
+    const old_lines_count: usize = if (e.bot_line == 0)
+        lines.items.len - top_line_index
+    else blk: {
+        // `bot != 0` means the entry records an old span of length
+        // `bot - top - 1`. Underflow means the entry is malformed.
+        if (top_line_index >= e.bot_line) return error.RangeOutOfBounds;
+        break :blk e.bot_line - top_line_index - 1;
+    };
+    if (top_line_index + old_lines_count > lines.items.len) return error.RangeOutOfBounds;
 
     var new_items: std.ArrayList([]const u8) = .empty;
     defer new_items.deinit(alloc);
     for (e.lines) |line| try new_items.append(alloc, line.bytes);
 
-    try lines.replaceRange(alloc, top, oldsize, new_items.items);
+    try lines.replaceRange(alloc, top_line_index, old_lines_count, new_items.items);
 }
 
 const testing = std.testing;
@@ -115,21 +106,21 @@ fn splitLines(alloc: std.mem.Allocator, s: []const u8) ![]const []const u8 {
     defer out.deinit(alloc);
     var it = std.mem.splitScalar(u8, s, '\n');
     while (it.next()) |line| {
-        if (line.len == 0 and it.peek() == null) break;
+        // `splitScalar` emits a synthetic empty slice after a trailing '\n'.
+        // Drop only that trailing empty; empty interior lines are kept.
+        if (line.len == 0) {
+            if (it.peek() == null) break;
+        }
         try out.append(alloc, line);
     }
     return out.toOwnedSlice(alloc);
-}
-
-fn readText(alloc: std.mem.Allocator, s: []const u8) ![]const []const u8 {
-    return splitLines(alloc, s);
 }
 
 test "snapshotAt newhead returns saved file content" {
     const fh = try undofile.Parser.parse(allocator, single_bytes);
     defer undofile.Parser.deinit(fh, allocator);
 
-    const text = try readText(allocator, single_text);
+    const text = try splitLines(allocator, single_text);
     defer allocator.free(text);
 
     const got = try snapshotAt(allocator, text, &fh, fh.seq_last);
@@ -139,50 +130,50 @@ test "snapshotAt newhead returns saved file content" {
     for (text, got.lines) |w, l| try testing.expectEqualStrings(w, l);
 }
 
-    test "multitree leaves reconstruct correctly" {
-        const fh = try undofile.Parser.parse(allocator, multi_bytes);
-        defer undofile.Parser.deinit(fh, allocator);
+test "multitree leaves reconstruct correctly" {
+    const fh = try undofile.Parser.parse(allocator, multi_bytes);
+    defer undofile.Parser.deinit(fh, allocator);
 
-        const newhead_text = try readText(allocator, multi_text);
-        defer allocator.free(newhead_text);
+    const newhead_text = try splitLines(allocator, multi_text);
+    defer allocator.free(newhead_text);
 
-        // Snapshotting a seq that's on the redo chain reachable from the
-        // curhead gives the buffer state immediately after that edit;
-        // seqs on abandoned branches (H2, the path the user undid away
-        // from) cannot be reconstructed without the in-memory entries
-        // nvim discarded when the user took the undo branch.
-        const reachable = [_]struct { seq: u32, want: []const u8 }{
-            .{ .seq = 3, .want = "init\nappendA\nappendC" },
-            .{ .seq = 1, .want = "init\nappendA" },
-        };
-        for (reachable) |c| {
-            const got = try snapshotAt(allocator, newhead_text, &fh, c.seq);
-            defer deinit(got, allocator);
-            const want_lines = try splitLines(allocator, c.want);
-            defer allocator.free(want_lines);
-            try testing.expectEqual(want_lines.len, got.lines.len);
-            for (want_lines, got.lines) |w, l| try testing.expectEqualStrings(w, l);
-        }
-
-        try testing.expectError(error.SeqNotFound, snapshotAt(allocator, newhead_text, &fh, 2));
+    // Snapshotting a seq on the redo chain reachable from the curhead gives
+    // the buffer state immediately after that edit. Seqs on abandoned
+    // branches (H2, the path the user undid away from) cannot be reconstructed
+    // without the in-memory entries nvim discarded when the user took the
+    // undo branch.
+    const reachable = [_]struct { seq: u32, want: []const u8 }{
+        .{ .seq = 3, .want = "init\nappendA\nappendC" },
+        .{ .seq = 1, .want = "init\nappendA" },
+    };
+    for (reachable) |c| {
+        const got = try snapshotAt(allocator, newhead_text, &fh, c.seq);
+        defer deinit(got, allocator);
+        const want_lines = try splitLines(allocator, c.want);
+        defer allocator.free(want_lines);
+        try testing.expectEqual(want_lines.len, got.lines.len);
+        for (want_lines, got.lines) |w, l| try testing.expectEqualStrings(w, l);
     }
 
-    test "diff between reachable multitree leaves" {
-        const fh = try undofile.Parser.parse(allocator, multi_bytes);
-        defer undofile.Parser.deinit(fh, allocator);
-        const newhead_text = try readText(allocator, multi_text);
-        defer allocator.free(newhead_text);
+    try testing.expectError(error.SeqNotFound, snapshotAt(allocator, newhead_text, &fh, 2));
+}
 
-        const a = try snapshotAt(allocator, newhead_text, &fh, 1);
-        defer deinit(a, allocator);
-        const b = try snapshotAt(allocator, newhead_text, &fh, 3);
-        defer deinit(b, allocator);
+test "diff between reachable multitree leaves" {
+    const fh = try undofile.Parser.parse(allocator, multi_bytes);
+    defer undofile.Parser.deinit(fh, allocator);
+    const newhead_text = try splitLines(allocator, multi_text);
+    defer allocator.free(newhead_text);
 
-        try testing.expectEqual(@as(usize, 2), a.lines.len);
-        try testing.expectEqual(@as(usize, 3), b.lines.len);
-        try testing.expectEqualStrings("init", a.lines[0]);
-        try testing.expectEqualStrings("appendA", a.lines[1]);
-        try testing.expectEqualStrings("init", b.lines[0]);
-        try testing.expectEqualStrings("appendA", b.lines[1]);
-        try testing.expectEqualStrings("appendC", b.lines[2]);
-    }
+    const a = try snapshotAt(allocator, newhead_text, &fh, 1);
+    defer deinit(a, allocator);
+    const b = try snapshotAt(allocator, newhead_text, &fh, 3);
+    defer deinit(b, allocator);
+
+    try testing.expectEqual(@as(usize, 2), a.lines.len);
+    try testing.expectEqual(@as(usize, 3), b.lines.len);
+    try testing.expectEqualStrings("init", a.lines[0]);
+    try testing.expectEqualStrings("appendA", a.lines[1]);
+    try testing.expectEqualStrings("init", b.lines[0]);
+    try testing.expectEqualStrings("appendA", b.lines[1]);
+    try testing.expectEqualStrings("appendC", b.lines[2]);
+}
